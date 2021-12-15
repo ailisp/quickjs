@@ -62,16 +62,16 @@
 #define MALLOC_OVERHEAD  8
 #endif
 
-#if !defined(_WIN32)
+#if !(defined(_WIN32) || defined(__wasi__))
 /* define it if printf uses the RNDN rounding mode instead of RNDNA */
 #define CONFIG_PRINTF_RNDN
 #endif
 
 /* define to include Atomics.* operations which depend on the OS
    threads */
-#if !defined(EMSCRIPTEN)
-#define CONFIG_ATOMICS
-#endif
+// #if !defined(EMSCRIPTEN)
+// #define CONFIG_ATOMICS
+// #endif
 
 #if !defined(EMSCRIPTEN)
 /* enable stack limitation */
@@ -386,13 +386,6 @@ typedef struct JSFloatEnv {
     bf_flags_t flags;
     unsigned int status;
 } JSFloatEnv;
-
-/* the same structure is used for big integers and big floats. Big
-   integers are never infinite or NaNs */
-typedef struct JSBigFloat {
-    JSRefCountHeader header; /* must come first, 32-bit */
-    bf_t num;
-} JSBigFloat;
 
 typedef struct JSBigDecimal {
     JSRefCountHeader header; /* must come first, 32-bit */
@@ -1131,12 +1124,6 @@ static inline bfdec_t *JS_GetBigDecimal(JSValueConst val)
     JSBigDecimal *p = JS_VALUE_GET_PTR(val);
     return &p->num;
 }
-static JSValue JS_NewBigInt(JSContext *ctx);
-static inline bf_t *JS_GetBigInt(JSValueConst val)
-{
-    JSBigFloat *p = JS_VALUE_GET_PTR(val);
-    return &p->num;
-}
 static JSValue JS_CompactBigInt1(JSContext *ctx, JSValue val,
                                  BOOL convert_to_safe_integer);
 static JSValue JS_CompactBigInt(JSContext *ctx, JSValue val);
@@ -1680,7 +1667,7 @@ static inline size_t js_def_malloc_usable_size(void *ptr)
     return malloc_size(ptr);
 #elif defined(_WIN32)
     return _msize(ptr);
-#elif defined(EMSCRIPTEN)
+#elif defined(EMSCRIPTEN) || defined(__wasi__)
     return 0;
 #elif defined(__linux__)
     return malloc_usable_size(ptr);
@@ -1754,7 +1741,7 @@ static const JSMallocFunctions def_malloc_funcs = {
     malloc_size,
 #elif defined(_WIN32)
     (size_t (*)(const void *))_msize,
-#elif defined(EMSCRIPTEN)
+#elif defined(EMSCRIPTEN) || defined(__wasi__)
     NULL,
 #elif defined(__linux__)
     (size_t (*)(const void *))malloc_usable_size,
@@ -3861,6 +3848,11 @@ static JSValue string_buffer_end(StringBuffer *s)
     return JS_MKPTR(JS_TAG_STRING, str);
 }
 
+JSValue JS_NewStringLenRaw(JSContext *ctx, const char *buf, size_t buf_len)
+{
+    return js_new_string8(ctx, (const uint8_t *)buf, buf_len);
+}
+
 /* create a string from a UTF-8 buffer */
 JSValue JS_NewStringLen(JSContext *ctx, const char *buf, size_t buf_len)
 {
@@ -3966,6 +3958,36 @@ JSValue JS_NewAtomString(JSContext *ctx, const char *str)
     JSValue val = JS_AtomToString(ctx, atom);
     JS_FreeAtom(ctx, atom);
     return val;
+}
+
+const char *JS_ToCStringLenRaw(JSContext *ctx, size_t *plen, JSValueConst val1)
+{
+    JSValue val;
+    JSString *str;
+    int len;
+
+    if (JS_VALUE_GET_TAG(val1) != JS_TAG_STRING) {
+        val = JS_ToString(ctx, val1);
+        if (JS_IsException(val))
+            goto fail;
+    } else {
+        val = JS_DupValue(ctx, val1);
+    }
+    
+    str = JS_VALUE_GET_STRING(val);
+    len = str->len;
+    if (!str->is_wide_char) {
+        const uint8_t *src = str->u.str8;
+        if (plen)
+            *plen = len;
+        return (const char *)src;
+    } else {
+        goto fail;
+    }
+ fail:
+    if (plen)
+        *plen = 0;
+    return NULL;
 }
 
 /* return (NULL, 0) if exception. */
@@ -4724,7 +4746,7 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
 {
     JSObject *p;
 
-    js_trigger_gc(ctx->rt, sizeof(JSObject));
+    // js_trigger_gc(ctx->rt, sizeof(JSObject));
     p = js_malloc(ctx, sizeof(JSObject));
     if (unlikely(!p))
         goto fail;
@@ -10859,6 +10881,14 @@ int JS_ToInt64Ext(JSContext *ctx, int64_t *pres, JSValueConst val)
         return JS_ToInt64(ctx, pres, val);
 }
 
+int JS_ToUInt64Ext(JSContext *ctx, uint64_t *pres, JSValueConst val)
+{
+    if (JS_IsBigInt(ctx, val))
+        return JS_ToBigUint64(ctx, pres, val);
+    else
+        return JS_ToInt64(ctx, (int64_t *)pres, val);
+}
+
 /* return (<0, 0) in case of exception */
 static int JS_ToInt32Free(JSContext *ctx, int32_t *pres, JSValue val)
 {
@@ -12275,6 +12305,25 @@ int JS_ToBigInt64(JSContext *ctx, int64_t *pres, JSValueConst val)
     return JS_ToBigInt64Free(ctx, pres, JS_DupValue(ctx, val));
 }
 
+static int JS_ToBigUint64Free(JSContext *ctx, uint64_t *pres, JSValue val)
+{
+    bf_t a_s, *a;
+
+    a = JS_ToBigIntFree(ctx, &a_s, val);
+    if (!a) {
+        *pres = 0;
+        return -1;
+    }
+    bf_get_uint64(pres, a);
+    JS_FreeBigInt(ctx, a, &a_s);
+    return 0;
+}
+
+int JS_ToBigUint64(JSContext *ctx, uint64_t *pres, JSValueConst val)
+{
+    return JS_ToBigUint64Free(ctx, pres, JS_DupValue(ctx, val));
+}
+
 static JSBigFloat *js_new_bf(JSContext *ctx)
 {
     JSBigFloat *p;
@@ -12308,7 +12357,7 @@ static JSValue JS_NewBigDecimal(JSContext *ctx)
     return JS_MKPTR(JS_TAG_BIG_DECIMAL, p);
 }
 
-static JSValue JS_NewBigInt(JSContext *ctx)
+JSValue JS_NewBigInt(JSContext *ctx)
 {
     JSBigFloat *p;
     p = js_malloc(ctx, sizeof(*p));
@@ -14186,6 +14235,13 @@ JSValue JS_NewBigUint64(JSContext *ctx, uint64_t v)
 }
 
 int JS_ToBigInt64(JSContext *ctx, int64_t *pres, JSValueConst val)
+{
+    JS_ThrowUnsupportedBigint(ctx);
+    *pres = 0;
+    return -1;
+}
+
+int JS_ToBigUint64(JSContext *ctx, uint64_t *pres, JSValueConst val)
 {
     JS_ThrowUnsupportedBigint(ctx);
     *pres = 0;
@@ -27685,7 +27741,7 @@ static int exported_names_cmp(const void *p1, const void *p2, void *opaque)
     return ret;
 }
 
-static JSValue js_get_module_ns(JSContext *ctx, JSModuleDef *m);
+JSValue js_get_module_ns(JSContext *ctx, JSModuleDef *m);
 
 static JSValue js_module_ns_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
                                      void *opaque)
@@ -27797,7 +27853,7 @@ static JSValue js_build_module_ns(JSContext *ctx, JSModuleDef *m)
     return JS_EXCEPTION;
 }
 
-static JSValue js_get_module_ns(JSContext *ctx, JSModuleDef *m)
+JSValue js_get_module_ns(JSContext *ctx, JSModuleDef *m)
 {
     if (JS_IsUndefined(m->module_ns)) {
         JSValue val;

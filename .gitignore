@@ -1,0 +1,17 @@
+.obj
+hello.wasm
+qjsc
+code.h
+/hello.js
+/hello.c
+hello_near.wasm
+counter.wasm
+/methods.h
+nft.wasm
+bignum.wasm
+/qjs
+/qjscalc.c
+/repl.c
+/hello_module.c
+/build_near.sh
+/near_tests.wasm
